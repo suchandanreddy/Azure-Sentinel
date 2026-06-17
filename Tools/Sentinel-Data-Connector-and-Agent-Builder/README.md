@@ -23,11 +23,15 @@ git sparse-checkout init --cone
 git sparse-checkout set Tools/Sentinel-Data-Connector-and-Agent-Builder
 git checkout
 
-# 3. Open the folder in VS Code AS THE WORKSPACE ROOT (required — see note below)
+# 3. Open the folder in VS Code AS THE WORKSPACE ROOT (required — see note below).
+#    In VS Code: File → Open Folder… → select Tools/Sentinel-Data-Connector-and-Agent-Builder
+#    (Or, if the `code` CLI is on your PATH, run the line below instead.)
 code Tools/Sentinel-Data-Connector-and-Agent-Builder
 ```
 
 > **Why open the folder as the workspace root?** The agent is delivered as GitHub Copilot **custom instructions + skills** (`.github/copilot-instructions.md` and `.github/skills/`). GitHub Copilot Chat only loads these when they sit at the **root of the open workspace**. If you open the Azure-Sentinel repo root instead, the agent will not load.
+
+> **The `code` command is optional.** It may not be on your `PATH`. The reliable way to open the folder is from the VS Code UI: **File → Open Folder…** and select `Tools/Sentinel-Data-Connector-and-Agent-Builder`.
 
 Once VS Code opens, install the prerequisites below, then start a GitHub Copilot Chat session — the agent's instructions load automatically.
 
