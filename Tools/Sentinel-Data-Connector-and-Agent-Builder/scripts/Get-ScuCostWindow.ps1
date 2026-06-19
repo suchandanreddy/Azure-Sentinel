@@ -11,7 +11,7 @@
 
       (1) HOUR-CROSSING LAW
           Create at 8:40, delete at 9:30 -> spans 2 blocks -> $8 (not $4).
-          Create at 9:01, delete at 9:55 -> spans 1 block  -> $4.
+          Create at 9:01, delete at 9:48 -> spans 1 block  -> $4.
 
       (2) SAME-HOUR RE-CREATE LAW
           Create -> delete -> create within one clock-hour bills TWO SCU-hours
@@ -22,14 +22,22 @@
     create/delete decision and surfaces its `recommendation` field to the
     developer. The Ensure-SccCapacity.ps1 / Remove-SccCapacity.ps1 scripts also
     use its `recommendedDeleteAtFor1HrBudget` field to align their auto-delete
-    timers to the :55 of the last paid clock hour.
+    timers to the :48 of the last paid clock hour.
 
 .PARAMETER HoursOfBudget
     Number of CLOCK-HOUR blocks the developer wants to pay for in this session.
     Default 1 (~$4 for 1 SCU at standard rate). The helper computes
-    `recommendedDeleteAtForNHrBudget = startOfHour(now) + N hours - 5 min`
-    (the 5-min cushion absorbs delete-API latency before the next hour rolls
-    over and silently adds another $4 to the bill).
+    `recommendedDeleteAtForNHrBudget = startOfHour(now) + N hours - 12 min`
+    (the 12-min cushion absorbs the SCU delete (a long-running operation) trailing ~10-min backend
+    deprovisioning settlement before the next hour rolls over and silently
+    adds another $4 to the bill).
+
+.PARAMETER DeleteBufferMinutes
+    Minutes before the next clock-hour boundary at which the auto-delete is
+    aligned (default 12 -> :48). SCU delete is an async long-running operation whose final billing
+    settlement lands ~10 min after the delete request; the 12-min cushion keeps
+    that settlement inside the paid block. Lower to e.g. 15 (:45) for extra
+    safety at the cost of ~3 fewer testing minutes.
 
 .PARAMETER Units
     Number of SCUs the developer plans to provision. Default 1. Used only to
@@ -71,12 +79,12 @@
       "minutesRemainingThisHour":       <int 1..60>,
       "hoursOfBudget":                  <int>,
       "recommendedCreateAt":            "<ISO>",  # next :01 if wait recommended; nowUtc otherwise
-      "recommendedDeleteAtForNHrBudget":"<ISO>",  # startOfHour + N hours - 5 min, floor = now+5min
+      "recommendedDeleteAtForNHrBudget":"<ISO>",  # startOfHour + N hours - 12 min, floor = now+5min
       "tier":                           "block-creation" | "soft-warn" | "proceed",
       "reasoning":                      "<one-line plain-English explanation>",
       "waitMinutesToNextHour":          <int 0..59>,
       "estimatedBillIfCreateNowUsd":    <int>,  # if create now + delete at recommendedDelete -> dollars
-      "estimatedBillIfWaitAndCreateUsd":<int>,  # if wait to :01 + delete at :55 of last paid hour
+      "estimatedBillIfWaitAndCreateUsd":<int>,  # if wait to :01 + delete at :48 of last paid hour
       "estimatedWallClockMinutesIfCreateNow":   <int>,
       "estimatedWallClockMinutesIfWaitAndCreate":<int>,
       "sameHourRecreateRisk":           $true | $false,  # true iff PreviousDeleteAt is in the current clock-hour block
@@ -98,7 +106,7 @@
 
 .EXAMPLE
     ./scripts/Get-ScuCostWindow.ps1 -HoursOfBudget 2 -Units 2
-    # -> 2 SCU * 2 hour blocks recommendation; recommendedDeleteAt is :55 of the (next-hour+1)
+    # -> 2 SCU * 2 hour blocks recommendation; recommendedDeleteAt is :48 of the (next-hour+1)
 #>
 
 [CmdletBinding()]
@@ -108,6 +116,7 @@ param(
     [Parameter(Mandatory=$false)] [int]$ScuPerHourUsd = 4,
     [Parameter(Mandatory=$false)] [int]$BlockTierMinutes = 15,
     [Parameter(Mandatory=$false)] [int]$SoftWarnTierMinutes = 30,
+    [Parameter(Mandatory=$false)] [int]$DeleteBufferMinutes = 12,
     [Parameter(Mandatory=$false)] [string]$NowOverride,
     [Parameter(Mandatory=$false)] [string]$PreviousDeleteAt,
     [Parameter(Mandatory=$false)] [switch]$Json
@@ -168,10 +177,14 @@ if ($tier -eq 'block-creation' -or $sameHourRecreate) {
 }
 
 # recommendedDeleteAtForNHrBudget:
-#   startOfHour + N hours - 5 min  (5-min cushion before next hour rollover)
+#   startOfHour + N hours - DeleteBufferMinutes (default 12 -> :48 of the last
+#   paid clock hour). The 12-min cushion absorbs the SCU delete (a long-running operation) trailing ~10-min
+#   backend deprovisioning settlement so the final "Capacities_Delete Succeeded"
+#   event lands BEFORE the next clock hour rolls (a :55/-5min delete settles ~:05
+#   of the next block and double-bills $4 -> $8).
 #   FLOOR at now + 5 min (don't propose a delete in the past or too close to now).
 #   If proposed time is too close, push by one hour at a time until safe.
-$proposedDelete = $currentHourStart.AddHours($HoursOfBudget).AddMinutes(-5)
+$proposedDelete = $currentHourStart.AddHours($HoursOfBudget).AddMinutes(-$DeleteBufferMinutes)
 $minSafeDelete  = $now.AddMinutes(5)
 while ($proposedDelete -lt $minSafeDelete) {
     $proposedDelete = $proposedDelete.AddHours(1)
@@ -180,11 +193,11 @@ $recommendedDeleteAt = $proposedDelete
 
 # -------- 6. Cost / wall-clock projection ------------------------------------
 # CREATE NOW: spans from now to recommendedDeleteAt -> bills every clock hour touched.
-# WAIT AND CREATE: spans from nextHourOne to (nextHourOne's-block + (N-1) hours).:55 -> bills N hours exactly.
+# WAIT AND CREATE: spans from nextHourOne to (nextHourOne's-block + (N-1) hours).:48 -> bills N hours exactly.
 function Get-BlocksTouched($from, $to) {
     $fromHour = $from.Date.AddHours($from.Hour)
     $toHour   = $to.Date.AddHours($to.Hour)
-    # If the deletion lands at :55 (i.e., still in $toHour block), blocks = (toHour - fromHour)/1h + 1
+    # If the deletion lands at :48 (i.e., still in $toHour block), blocks = (toHour - fromHour)/1h + 1
     $blocks = [int](($toHour - $fromHour).TotalHours) + 1
     if ($blocks -lt 1) { $blocks = 1 }
     return $blocks
@@ -193,8 +206,8 @@ function Get-BlocksTouched($from, $to) {
 $blocksCreateNow      = Get-BlocksTouched $now $recommendedDeleteAt
 $billCreateNowUsd     = $blocksCreateNow * $Units * $ScuPerHourUsd
 
-# Wait-and-create: starts at nextHourOne, deletes at :55 of the (N-th) subsequent hour.
-$waitDeleteAt          = $nextHourOne.Date.AddHours($nextHourOne.Hour).AddHours($HoursOfBudget).AddMinutes(-5)
+# Wait-and-create: starts at nextHourOne, deletes at :48 of the (N-th) subsequent hour.
+$waitDeleteAt          = $nextHourOne.Date.AddHours($nextHourOne.Hour).AddHours($HoursOfBudget).AddMinutes(-$DeleteBufferMinutes)
 $blocksWaitAndCreate   = Get-BlocksTouched $nextHourOne $waitDeleteAt
 $billWaitAndCreateUsd  = $blocksWaitAndCreate * $Units * $ScuPerHourUsd
 

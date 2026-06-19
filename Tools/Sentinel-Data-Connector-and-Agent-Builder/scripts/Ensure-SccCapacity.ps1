@@ -58,14 +58,24 @@
 .PARAMETER HoursOfBudget
     Default 1. Number of CLOCK-HOUR blocks of paid SCU time the developer
     wants. Schedules the auto-delete timer to fire at
-    startOfHour(createdAt) + (N hours) - 5 min  (the 5-min cushion absorbs
-    delete-API latency before the next clock-hour rolls over and silently
-    bills another $4). This is the cost-optimal default — testing started
-    inside a clock-hour block always pays for that block; the timer ensures
-    no second block is paid by accident. Set HoursOfBudget=2 for a 2-block
-    session, etc. Ignored when -AutoDeleteAfterMinutes > 0 (legacy override).
+    startOfHour(createdAt) + (N hours) - DeleteBufferMinutes (default 12 ->
+    :48; the 12-min cushion absorbs the SCU delete (a long-running operation) trailing ~10-min backend
+    deprovisioning settlement before the next clock-hour rolls over and
+    silently bills another $4). This is the cost-optimal default — testing
+    started inside a clock-hour block always pays for that block; the timer
+    ensures no second block is paid by accident. Set HoursOfBudget=2 for a
+    2-block session, etc. Ignored when -AutoDeleteAfterMinutes > 0 (legacy
+    override).
     See:
     https://learn.microsoft.com/en-us/copilot/security/security-compute-units-capacity#how-provisioned-and-overage-scus-are-billed
+
+.PARAMETER DeleteBufferMinutes
+    Default 12. Minutes before the next clock-hour boundary at which the
+    clock-hour-aligned auto-delete fires (:48). SCU delete is an async long-running operation
+    whose final billing settlement lands ~10 min after the request; a :55
+    delete settles ~:05 of the next block and double-bills ($4 -> $8). The
+    12-min cushion keeps that settlement inside the paid block. Raise toward
+    15 (:45) for extra safety at the cost of a few testing minutes.
 
 .PARAMETER NoAutoDelete
     Disables the auto-delete timer. Equivalent to -AutoDeleteAfterMinutes 0.
@@ -160,6 +170,7 @@ param(
     [Parameter(Mandatory=$false)] [switch]$AcceptRemappedRegion,
     [Parameter(Mandatory=$false)] [int]$AutoDeleteAfterMinutes = 0,
     [Parameter(Mandatory=$false)] [int]$HoursOfBudget = 1,
+    [Parameter(Mandatory=$false)] [int]$DeleteBufferMinutes = 12,
     [Parameter(Mandatory=$false)] [switch]$NoAutoDelete
 )
 
@@ -575,7 +586,8 @@ if (-not $match) {
 # -------- 4b. Schedule auto-delete (clock-hour-aligned by default) -----------
 # SCU is billed in WHOLE clock-hour blocks (NOT rolling 60-min windows). See:
 # https://learn.microsoft.com/en-us/copilot/security/security-compute-units-capacity#how-provisioned-and-overage-scus-are-billed
-# Default: align delete to :55 of the last paid clock hour (5-min cushion before next block bills).
+# Default: align delete to :48 of the last paid clock hour (12-min cushion absorbs
+# the SCU delete (a long-running operation) trailing ~10-min backend settlement before the next block bills).
 # Legacy: -AutoDeleteAfterMinutes <n> preserves minutes-relative math for power users.
 $autoDeleteInfo = $null
 $shouldSchedule = (-not $result.AlreadyExisted) -and (-not $NoAutoDelete)
@@ -592,7 +604,7 @@ if ($shouldSchedule) {
     } else {
         # CLOCK-HOUR-ALIGNED default path
         $startOfHour     = $createdAtUtc.Date.AddHours($createdAtUtc.Hour)
-        $scheduledForUtc = $startOfHour.AddHours($HoursOfBudget).AddMinutes(-5)
+        $scheduledForUtc = $startOfHour.AddHours($HoursOfBudget).AddMinutes(-$DeleteBufferMinutes)
         # Floor: if the proposed delete is in the past or too close to now,
         # push by one hour at a time until safe (>= now + 2 min).
         $minSafe = $createdAtUtc.AddMinutes(2)
@@ -632,7 +644,7 @@ if ($shouldSchedule) {
         nukeRg          = [bool]$useDedicatedRg
     }
     if ($alignmentMode -eq 'clock-hour') {
-        Write-Ok "Auto-delete scheduled for $($scheduledForUtc.ToString('HH:mm')) UTC (:55 of the last paid clock hour; HoursOfBudget=$HoursOfBudget; PID $autoPid). Log: $logPath"
+        Write-Ok "Auto-delete scheduled for $($scheduledForUtc.ToString('HH:mm')) UTC (:48 of the last paid clock hour; HoursOfBudget=$HoursOfBudget; PID $autoPid). Log: $logPath"
     } else {
         Write-Ok "Auto-delete scheduled in $effectiveMinutes min (PID $autoPid). Log: $logPath"
     }
