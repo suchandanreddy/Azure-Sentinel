@@ -17,6 +17,8 @@ config/ingestion-schemas.json
 config/ingestion-schemas.json.*
 config/entities.json
 config/entities.json.*
+config/scu-automation.json
+config/scu-automation.json.*
 config/agent-instructions/*.md
 !config/agent-instructions/.gitkeep
 

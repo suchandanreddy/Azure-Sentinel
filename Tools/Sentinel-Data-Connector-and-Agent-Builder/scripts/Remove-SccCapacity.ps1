@@ -115,8 +115,24 @@ if ($scc.createdAt) {
     } catch { }
 }
 
-# -------- 2b. Cancel any pending auto-delete timer (prevent race) -----------
-if ($scc.autoDelete -and $scc.autoDelete.pid) {
+# -------- 2b. Cancel any pending auto-delete (prevent race) -----------------
+if ($scc.autoDelete -and ($scc.autoDelete.deletionMode -eq 'server')) {
+    # SERVER mode: cancel the Logic App reaper run so it doesn't fire later.
+    # (The RG delete below is idempotent, but cancelling avoids a duplicate/late run.)
+    $runId     = "$($scc.autoDelete.automationRunId)".Trim()
+    $logicAppId = "$($scc.autoDelete.logicAppId)".Trim()
+    if ($runId -and $logicAppId) {
+        try {
+            az rest --method post `
+                --uri "$logicAppId/runs/$runId/cancel?api-version=2016-06-01" `
+                --output none 2>$null
+            Write-Info "Cancelled server-side auto-delete (Logic App run $runId)."
+        } catch {
+            Write-Info "Could not cancel Logic App run $runId (it may have already completed); proceeding with delete."
+        }
+    }
+} elseif ($scc.autoDelete -and $scc.autoDelete.pid) {
+    # LOCAL mode: kill the nohup sleep timer.
     $autoPid = "$($scc.autoDelete.pid)".Trim()
     if ($autoPid) {
         try {

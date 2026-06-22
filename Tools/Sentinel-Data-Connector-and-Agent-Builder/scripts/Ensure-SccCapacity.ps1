@@ -171,7 +171,12 @@ param(
     [Parameter(Mandatory=$false)] [int]$AutoDeleteAfterMinutes = 0,
     [Parameter(Mandatory=$false)] [int]$HoursOfBudget = 1,
     [Parameter(Mandatory=$false)] [int]$DeleteBufferMinutes = 12,
-    [Parameter(Mandatory=$false)] [switch]$NoAutoDelete
+    [Parameter(Mandatory=$false)] [switch]$NoAutoDelete,
+    [Parameter(Mandatory=$false)]
+    [ValidateSet('local','server')]
+    [string]$DeletionMode = 'local',
+    [Parameter(Mandatory=$false)] [string]$NotifyEmail,
+    [Parameter(Mandatory=$false)] [string]$AutomationConfigPath = 'config/scu-automation.json'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -509,8 +514,8 @@ if (-not $match) {
         Write-Err2 "No matching SCU capacity. CREATE requires -Confirm (developer cost-acknowledgement gate)."
         Write-Host ""
         Write-Host "COST WARNING:" -ForegroundColor Yellow
-        Write-Host "  SCU capacity bills at ~ \$4 USD per SCU per hour while it exists."
-        Write-Host "  $Units SCU = ~ \$$([math]::Round($Units * 4)) / hr = ~ \$$([math]::Round($Units * 4 * 24)) / day = ~ \$$([math]::Round($Units * 4 * 730)) / month."
+        Write-Host "  SCU capacity bills at ~ `$4 USD per SCU per hour while it exists."
+        Write-Host "  $Units SCU = ~ `$$([math]::Round($Units * 4)) / hr = ~ `$$([math]::Round($Units * 4 * 24)) / day = ~ `$$([math]::Round($Units * 4 * 730)) / month."
         Write-Host "  Run Remove-SccCapacity.ps1 immediately when your testing session ends."
         Write-Host ""
         Write-Host "Re-run with -Confirm to proceed:" -ForegroundColor Yellow
@@ -616,39 +621,127 @@ if ($shouldSchedule) {
     $sleepSec     = [int]($scheduledForUtc - $createdAtUtc).TotalSeconds
     if ($sleepSec -lt 60) { $sleepSec = 60 }  # absolute floor
     $scheduledFor = $scheduledForUtc.ToString('o')
+    # Warn 10 min before delete; floor at now+1min if the window is very short.
+    $notifyForUtc = $scheduledForUtc.AddMinutes(-10)
+    if ($notifyForUtc -lt $createdAtUtc.AddMinutes(1)) { $notifyForUtc = $createdAtUtc.AddMinutes(1) }
+    $notifyFor    = $notifyForUtc.ToString('o')
 
-    $logDir = Join-Path (Split-Path $PSScriptRoot -Parent) '.scu-autodelete'
-    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
-    $logPath = Join-Path $logDir "$($result.Name).log"
-    $scriptPath = Join-Path $PSScriptRoot 'Remove-SccCapacity.ps1'
-
-    $nukeFlag = if ($useDedicatedRg) { '-NukeResourceGroup' } else { '' }
-    $cmd = "sleep $sleepSec; pwsh -NoProfile -File `"$scriptPath`" -SubscriptionId `"$SubscriptionId`" -ResourceGroupName `"$ResourceGroupName`" -CapacityName `"$($result.Name)`" -Confirm $nukeFlag >> `"$logPath`" 2>&1"
-
-    if ($IsWindows) {
-        $proc = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile','-Command', $cmd) -WindowStyle Hidden -PassThru
-        $autoPid = $proc.Id
-    } else {
-        $autoPid = & bash -c "nohup bash -c '$cmd' > /dev/null 2>&1 & echo `$!"
-        $autoPid = "$autoPid".Trim()
+    if ($DeletionMode -eq 'server') {
+        # ---- SERVER-SIDE auto-delete via the one-time-deployed Logic App "reaper" ----
+        # Reliable even if the developer's workstation powers off: the wait+delete run in Azure.
+        if (-not (Test-Path $AutomationConfigPath)) {
+            Write-Warn2 "DeletionMode=server but '$AutomationConfigPath' not found. Run Setup-ScuAutoDelete.ps1 once per subscription first. Falling back to LOCAL timer."
+            $DeletionMode = 'local'
+        }
     }
 
-    $autoDeleteInfo = [pscustomobject]@{
-        pid             = $autoPid
-        scheduledAt     = $createdAtUtc.ToString('o')
-        scheduledFor    = $scheduledFor
-        afterMinutes    = $effectiveMinutes
-        hoursOfBudget   = $effectiveHoursOfBudget
-        alignmentMode   = $alignmentMode
-        logPath         = $logPath
-        nukeRg          = [bool]$useDedicatedRg
+    if ($DeletionMode -eq 'server') {
+        $auto = Get-Content $AutomationConfigPath -Raw | ConvertFrom-Json
+        if ($auto.subscriptionId -and ($auto.subscriptionId -ne $SubscriptionId)) {
+            Write-Warn2 "scu-automation.json is for subscription $($auto.subscriptionId) but this capacity is in $SubscriptionId. Re-run Setup-ScuAutoDelete.ps1 for this subscription. Falling back to LOCAL timer."
+            $DeletionMode = 'local'
+        }
+        if (-not $NotifyEmail) {
+            $signedInUpn = az account show --query user.name -o tsv 2>$null
+            if ($signedInUpn) { $NotifyEmail = "$signedInUpn".Trim() }
+        }
+        if (-not $NotifyEmail) {
+            Write-Warn2 "DeletionMode=server requires a notification email (could not resolve signed-in UPN). Falling back to LOCAL timer."
+            $DeletionMode = 'local'
+        }
     }
-    if ($alignmentMode -eq 'clock-hour') {
-        Write-Ok "Auto-delete scheduled for $($scheduledForUtc.ToString('HH:mm')) UTC (:48 of the last paid clock hour; HoursOfBudget=$HoursOfBudget; PID $autoPid). Log: $logPath"
-    } else {
-        Write-Ok "Auto-delete scheduled in $effectiveMinutes min (PID $autoPid). Log: $logPath"
+
+    if ($DeletionMode -eq 'server') {
+        try {
+            # Least-privilege: grant the reaper MI Contributor ONLY on this session's dedicated RG.
+            # Cascades away when the RG is deleted. ACS Contributor was granted once at Setup time.
+            $rgId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
+            Write-Info "Granting reaper MI Contributor on '$ResourceGroupName' (least-privilege, per-session)..."
+            az role assignment create `
+                --assignee-object-id $auto.miPrincipalId `
+                --assignee-principal-type ServicePrincipal `
+                --role Contributor `
+                --scope $rgId --output none 2>$null
+            # Role propagation can lag; the Logic App waits >=1 min before any ARM call so this is safe.
+
+            # Callback URL is a SAS secret — fetch fresh each session, never persist it.
+            $cbUrl = az rest --method post `
+                --uri "$($auto.logicAppId)/triggers/Start/listCallbackUrl?api-version=2016-06-01" `
+                --query value -o tsv
+            if (-not $cbUrl) { throw "Could not obtain Logic App callback URL." }
+
+            $payload = @{
+                subscriptionId = $SubscriptionId
+                resourceGroup  = $ResourceGroupName
+                capacityName   = $result.Name
+                deleteAt       = $scheduledFor
+                notifyAt       = $notifyFor
+                email          = $NotifyEmail
+                acsEndpoint    = $auto.acsEndpoint
+                senderAddress  = $auto.senderAddress
+            } | ConvertTo-Json -Compress
+
+            $resp = Invoke-WebRequest -Method Post -Uri $cbUrl -ContentType 'application/json' -Body $payload -UseBasicParsing
+            $runId = $resp.Headers['x-ms-workflow-run-id']
+            if ($runId -is [array]) { $runId = $runId[0] }
+
+            $autoDeleteInfo = [pscustomobject]@{
+                deletionMode        = 'server'
+                scheduledAt         = $createdAtUtc.ToString('o')
+                scheduledFor        = $scheduledFor
+                notifyAt            = $notifyFor
+                notifyEmail         = $NotifyEmail
+                afterMinutes        = $effectiveMinutes
+                hoursOfBudget       = $effectiveHoursOfBudget
+                alignmentMode       = $alignmentMode
+                logicAppId          = $auto.logicAppId
+                automationRunId     = "$runId".Trim()
+                nukeRg              = [bool]$useDedicatedRg
+            }
+            Write-Ok "Server-side auto-delete armed: Logic App run $runId will delete '$ResourceGroupName' at $($scheduledForUtc.ToString('HH:mm')) UTC (warning email to $NotifyEmail ~10 min prior). No client needs to stay running."
+            Write-Info "To cancel: run Remove-SccCapacity.ps1 -Confirm (cancels the Logic App run and deletes now)."
+        } catch {
+            Write-Warn2 "Server-side arming failed ($($_.Exception.Message)). Falling back to LOCAL timer."
+            $DeletionMode = 'local'
+        }
     }
-    Write-Info "To cancel: kill $autoPid    (or run Remove-SccCapacity.ps1 -Confirm)"
+
+    if ($DeletionMode -eq 'local') {
+        $logDir = Join-Path (Split-Path $PSScriptRoot -Parent) '.scu-autodelete'
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+        $logPath = Join-Path $logDir "$($result.Name).log"
+        $scriptPath = Join-Path $PSScriptRoot 'Remove-SccCapacity.ps1'
+
+        $nukeFlag = if ($useDedicatedRg) { '-NukeResourceGroup' } else { '' }
+        $cmd = "sleep $sleepSec; pwsh -NoProfile -File `"$scriptPath`" -SubscriptionId `"$SubscriptionId`" -ResourceGroupName `"$ResourceGroupName`" -CapacityName `"$($result.Name)`" -Confirm $nukeFlag >> `"$logPath`" 2>&1"
+
+        if ($IsWindows) {
+            $proc = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile','-Command', $cmd) -WindowStyle Hidden -PassThru
+            $autoPid = $proc.Id
+        } else {
+            $autoPid = & bash -c "nohup bash -c '$cmd' > /dev/null 2>&1 & echo `$!"
+            $autoPid = "$autoPid".Trim()
+        }
+
+        $autoDeleteInfo = [pscustomobject]@{
+            deletionMode    = 'local'
+            pid             = $autoPid
+            scheduledAt     = $createdAtUtc.ToString('o')
+            scheduledFor    = $scheduledFor
+            afterMinutes    = $effectiveMinutes
+            hoursOfBudget   = $effectiveHoursOfBudget
+            alignmentMode   = $alignmentMode
+            logPath         = $logPath
+            nukeRg          = [bool]$useDedicatedRg
+        }
+        if ($alignmentMode -eq 'clock-hour') {
+            Write-Ok "Auto-delete scheduled for $($scheduledForUtc.ToString('HH:mm')) UTC (:48 of the last paid clock hour; HoursOfBudget=$HoursOfBudget; PID $autoPid). Log: $logPath"
+        } else {
+            Write-Ok "Auto-delete scheduled in $effectiveMinutes min (PID $autoPid). Log: $logPath"
+        }
+        Write-Warn2 "LOCAL timer: if this workstation sleeps/powers off before $($scheduledForUtc.ToString('HH:mm')) UTC, the SCU will NOT be deleted and keeps billing. Use -DeletionMode server for workstation-independent teardown."
+        Write-Info "To cancel: kill $autoPid    (or run Remove-SccCapacity.ps1 -Confirm)"
+    }
 } elseif ($NoAutoDelete -and -not $result.AlreadyExisted) {
     Write-Warn2 "Auto-delete DISABLED (-NoAutoDelete). You MUST run Remove-SccCapacity.ps1 when done — \$4/hr per SCU keeps accruing, billed in WHOLE clock-hour blocks."
 }
