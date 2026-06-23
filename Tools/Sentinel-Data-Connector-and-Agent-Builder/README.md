@@ -10,12 +10,12 @@ It guides you through seven phases — connector discovery, use-case ideation, d
 
 ## Get just this folder (sparse checkout)
 
-This tool lives inside the [Azure-Sentinel](https://github.com/suchandanreddy/Azure-Sentinel) repository under `Tools/Sentinel-Data-Connector-and-Agent-Builder/`. You do **not** need to download the whole repo — use a sparse checkout to pull only this folder, then open it in VS Code as the workspace root.
+This tool lives inside the [Azure-Sentinel](https://github.com/Azure/Azure-Sentinel) repository under `Tools/Sentinel-Data-Connector-and-Agent-Builder/`. You do **not** need to download the whole repo — use a sparse checkout to pull only this folder, then open it in VS Code as the workspace root.
 
 ```bash
 # 1. Clone with no files materialized yet (fast — skips the rest of the repo body)
 git clone --filter=blob:none --no-checkout --depth 1 \
-  https://github.com/suchandanreddy/Azure-Sentinel.git
+  https://github.com/Azure/Azure-Sentinel.git
 cd Azure-Sentinel
 
 # 2. Limit the checkout to just this tool's folder
