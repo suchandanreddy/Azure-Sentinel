@@ -132,20 +132,33 @@ if (-not (Test-Path $bicepPath)) { throw "Bicep template not found at $bicepPath
 
 $deployName = "scu-autodelete-$((Get-Date).ToString('yyyyMMddHHmmss'))"
 Write-Info "Deploying '$deployName' (this can take a few minutes — ACS managed domain provisioning is slow)..."
-$deployOut = az deployment group create `
-    --name $deployName `
-    --resource-group $AutomationResourceGroup `
-    --subscription $SubscriptionId `
-    --template-file $bicepPath `
-    --parameters location=$Location namePrefix=$NamePrefix "acsDataLocation=$AcsDataLocation" `
-    --query properties.outputs `
-    --output json 2>&1
+# Redirect az's stderr (WARNING lines, bicep-build notices) to a temp file so it never
+# pollutes the JSON on stdout — otherwise ConvertFrom-Json chokes on a leading "WARNING:".
+$errFile = [System.IO.Path]::GetTempFileName()
+try {
+    $deployOut = az deployment group create `
+        --name $deployName `
+        --resource-group $AutomationResourceGroup `
+        --subscription $SubscriptionId `
+        --template-file $bicepPath `
+        --parameters location=$Location namePrefix=$NamePrefix "acsDataLocation=$AcsDataLocation" `
+        --query properties.outputs `
+        --output json 2>$errFile
+    $deployErr = if (Test-Path $errFile) { (Get-Content $errFile -Raw) } else { '' }
+} finally {
+    Remove-Item $errFile -ErrorAction SilentlyContinue
+}
 if ($LASTEXITCODE -ne 0) {
     Write-Err2 "Deployment failed."
-    Write-Host ($deployOut | Out-String) -ForegroundColor Red
+    if ($deployErr)  { Write-Host $deployErr -ForegroundColor Red }
+    if ($deployOut)  { Write-Host ($deployOut | Out-String) -ForegroundColor Red }
     throw "Setup deployment failed."
 }
-$outputs = $deployOut | ConvertFrom-Json
+$deployOutStr = ($deployOut | Out-String).Trim()
+if ([string]::IsNullOrWhiteSpace($deployOutStr)) {
+    throw "Deployment reported success but returned no outputs. az stderr was:`n$deployErr"
+}
+$outputs = $deployOutStr | ConvertFrom-Json
 Write-Ok "Deployment succeeded."
 
 # -------- 4. Persist automation record --------------------------------------
